@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NY Tube</title>
+<meta name="description" content="Le métro de New York, LIRR et Metro-North en temps réel sur une carte du grand Manhattan.">
+<link rel="stylesheet" href="vendor/maplibre-gl.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="map"></div>
+
+<aside id="panel" class="sign">
+  <header>
+    <h1>NY Tube</h1>
+    <div id="clock">--:--</div>
+  </header>
+  <div id="stats"><span><b id="count">0</b> subway</span><span><b id="countRail">0</b> trains LIRR / MNR</span></div>
+  <div id="status">Chargement…</div>
+
+  <h2>Subway <small>clic : la ligne et son trafic</small></h2>
+  <div id="legend"></div>
+
+  <h2>Regional Rail</h2>
+  <div id="rail-legend">
+    <button class="rail-toggle on" data-a="LIRR"><span class="rail-chip lirr">LIRR</span> Long Island Rail Road</button>
+    <button class="rail-toggle on" data-a="MNR"><span class="rail-chip mnr">MNR</span> Metro-North</button>
+  </div>
+
+  <h2>Vue</h2>
+  <div class="modes" role="group" aria-label="Mode de vue">
+    <button data-mode="plan" class="on">Plan</button>
+    <button data-mode="3d">3D</button>
+    <button data-mode="under">Sous-sol</button>
+    <button data-mode="cab">Cabine</button>
+  </div>
+  <p class="foot">Positions métro estimées à partir des prévisions d'arrivée MTA, trains régionaux par GPS. Données : MTA, en direct.</p>
+</aside>
+
+<aside id="line-panel" class="sign hidden" aria-live="polite">
+  <button class="close" id="lineClose" aria-label="Fermer">×</button>
+  <header id="lineHead"></header>
+  <div id="lineStatus"></div>
+  <div id="lineAlerts"></div>
+  <div class="strip-head"><span>▲ Uptown</span><span id="lineCounts"></span><span>Downtown ▼</span></div>
+  <div id="strip"></div>
+</aside>
+
+<div id="cab-hud" class="sign hidden">
+  <div id="cabInfo"></div>
+  <div class="row">
+    <button id="cabNext">Autre rame</button>
+    <button id="cabExit">Quitter la cabine</button>
+  </div>
+</div>
+
+<script src="vendor/maplibre-gl.js"></script>
+<script src="lib/gtfsrt.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
