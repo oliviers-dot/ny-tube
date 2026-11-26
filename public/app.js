@@ -309,11 +309,27 @@ function prepRailGeo() {
   });
 }
 
-function snapRail(p, ag, routeId) {
+// prefer : tracé du relevé précédent, gardé tant que le train en reste proche (les branches ont
+// plusieurs tracés superposés : sans cela, la vitesse ne peut pas être mesurée d'un relevé à l'autre)
+function snapRail(p, ag, routeId, prefer) {
   let best = null;
+  if (prefer != null) {
+    best = snapRail1(p, (L, li) => li === prefer);
+    if (best && Math.sqrt(best.d) * M_LAT < 60) return best;
+    best = null;
+  }
   for (let pass = 0; pass < 2 && !best; pass++) {
+    best = snapRail1(p, (L) => L.a === ag && !(pass === 0 && routeId && L.r !== routeId));
+    if (best && Math.sqrt(best.d) * M_LAT > 250) best = null; // trop loin d'un tracé connu : GPS brut
+  }
+  return best;
+}
+
+function snapRail1(p, keep) {
+  let best = null;
+  {
     railGeo.forEach((L, li) => {
-      if (L.a !== ag || (pass === 0 && routeId && L.r !== routeId)) return;
+      if (!keep(L, li)) return;
       for (let i = 1; i < L.pts.length; i++) {
         const A = L.pts[i - 1], B = L.pts[i];
         const ax = (B[0] - A[0]) * KX, ay = B[1] - A[1], px = (p[0] - A[0]) * KX, py = p[1] - A[1];
@@ -323,7 +339,6 @@ function snapRail(p, ag, routeId) {
         if (!best || d < best.d) best = { d, li, s: L.cum[i - 1] + (L.cum[i] - L.cum[i - 1]) * u };
       }
     });
-    if (best && Math.sqrt(best.d) * M_LAT > 250) best = null; // trop loin d'un tracé connu : GPS brut
   }
   return best;
 }
@@ -379,7 +394,7 @@ function ingestRail(ag, feed) {
     const ft = Math.min(now, v.timestamp || feed.timestamp || now);
     const old = rail.get(id);
     if (old && old.raw[0] === cur[0] && old.raw[1] === cur[1]) { Object.assign(old, meta); continue; } // même relevé
-    const sn = snapRail(cur, ag, routeId);
+    const sn = snapRail(cur, ag, routeId, old && old.fix ? old.fix.li : null);
     const t = { ...meta, raw: cur, fix: sn ? { p: alongLine(railGeo[sn.li], sn.s).p, t: ft, li: sn.li, s: sn.s } : { p: cur, t: ft, li: null },
       v: 0, maxEx: 0, corr: [0, 0], corrAt: now, corrDur: CORR_S, dir: old && old.dir, shownP: old && old.shownP };
     if (old && old.fix) {
