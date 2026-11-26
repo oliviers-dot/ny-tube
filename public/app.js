@@ -157,7 +157,13 @@ function buildTimeline(t, now) {
 function position(tr, now) {
   const tl = tr.tl;
   if (!tl) return null;
-  const at = (i) => { const A = stationById[tl[i].id]; return { p: [A.lon, A.lat], at: tl[i].id, from: tl[i].id, next: tl[i + 1] ? tl[i + 1].id : null, f: 0 }; };
+  const at = (i) => {
+    const A = stationById[tl[i].id];
+    // à quai : orientation de la voie (segment suivant, sinon précédent), sans déplacement
+    const sg = tl[i + 1] ? segment(tl[i].id, tl[i + 1].id) : (i > 0 ? segment(tl[i - 1].id, tl[i].id) : null);
+    const dir = sg ? (tl[i + 1] ? along(sg, 0.02).dir : along(sg, 0.98).dir) : null;
+    return { p: [A.lon, A.lat], dir, still: true, at: tl[i].id, from: tl[i].id, next: tl[i + 1] ? tl[i + 1].id : null, f: 0 };
+  };
   if (now < tl[0].dep) return at(0);
   for (let i = 0; i < tl.length - 1; i++) {
     const a = tl[i], b = tl[i + 1];
@@ -217,7 +223,7 @@ async function getSnapshot() {
 async function refresh() {
   try {
     const data = await getSnapshot();
-    clockOffset = data.now - Date.now() / 1000;
+    // horloge locale (le relais peut servir un instantané vieux de 15 s : ne pas recaler dessus)
     const now = nowS();
     const seen = new Set();
     for (const t of data.trains) {
@@ -228,8 +234,16 @@ async function refresh() {
       if (old && old.shown && tr.tl) {
         // instant de la nouvelle frise où la rame est là où on l'affiche déjà : aucune téléportation,
         // l'écart est rattrapé en accélérant ou ralentissant doucement (jamais de marche arrière)
-        let best = 0, bd = Infinity;
-        for (let dt = -150; dt <= 150; dt += 2) {
+        const dist = (dt) => { const q = position(tr, now + dt); if (!q) return Infinity; const h = q.dir || tr.head; return seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7; };
+        let best = 0, bd = dist(0);
+        if (bd > 0.00005) for (let dt = -150; dt <= 150; dt += 3) {
+          const q = position(tr, now + dt);
+          if (!q) continue;
+          const h = q.dir || tr.head;
+          const d = seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7;
+          if (d < bd) { bd = d; best = dt; }
+        }
+        if (bd > 0.00005) for (let dt = best - 3; dt <= best + 3; dt += 0.2) { // affinage
           const q = position(tr, now + dt);
           if (!q) continue;
           const h = q.dir || tr.head;
@@ -696,7 +710,7 @@ function frame(ts) {
     tr.pos = pos;
     if (!pos) { tr.shown = null; continue; }
     if (pos.dir) tr.head = pos.dir;
-    tr.moving = !!pos.dir;
+    tr.moving = !!pos.dir && !pos.still;
     const p = tr.head ? offsetRight(pos.p, tr.head, sideM) : pos.p;
     tr.shown = p;
     perGroup[g] = (perGroup[g] || 0) + 1;
