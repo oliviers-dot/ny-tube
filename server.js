@@ -1,5 +1,6 @@
 // NY TUBE : petit serveur sans dépendance.
 //  - sert le front (public/)
+//  - /api/feed/<flux> : relais brut d'un flux GTFS-rt (secours si le navigateur ne joint pas la MTA)
 //  - /api/trains : relais optionnel des flux GTFS-realtime MTA (décodés, JSON compact).
 //    Le front interroge d'abord la MTA directement (CORS autorisé) et ne se sert de ce relais
 //    qu'en secours. Le front est donc aussi publiable tel quel sur n'importe quel hébergement statique.
@@ -54,7 +55,30 @@ function serveStatic(req, res) {
   });
 }
 
+// /api/feed/<chemin MTA> : relais brut (protobuf) d'un flux, mis en cache 10 s
+const feedCache = new Map();
+async function relayFeed(name) {
+  const c = feedCache.get(name);
+  if (c && Date.now() - c.at < 10000) return c.body;
+  const res = await fetch(MTA_BASE + name);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const body = Buffer.from(await res.arrayBuffer());
+  feedCache.set(name, { at: Date.now(), body });
+  return body;
+}
+
 http.createServer(async (req, res) => {
+  if (req.url.startsWith('/api/feed/')) {
+    const name = req.url.slice('/api/feed/'.length).split('?')[0];
+    if (!/^[a-z]+%2F[a-z-]+$/i.test(name)) { res.writeHead(400).end(); return; }
+    try {
+      const body = await relayFeed(name);
+      res.writeHead(200, { 'Content-Type': 'application/x-protobuf', 'Cache-Control': 'no-store' }).end(body);
+    } catch (e) {
+      res.writeHead(502).end(e.message);
+    }
+    return;
+  }
   if (req.url.startsWith('/api/trains')) {
     try {
       const c = await snapshot();

@@ -5,7 +5,8 @@
  * LIRR / Metro-North : positions GPS du flux, lissées entre deux relevés. */
 'use strict';
 
-const REFRESH_MS = 15000;
+const POLL_MS = 10000;        // les flux MTA changent toutes les 15 à 30 s : on regarde toutes les 10 s
+const CORR_S = 6;             // durée du rattrapage en douceur d'un train GPS
 const ALERTS_MS = 60000;
 const MANHATTAN = { center: [-73.975, 40.758], zoom: 12.1, bearing: -29 };
 const STYLE = 'https://tiles.openfreemap.org/styles/dark';
@@ -15,6 +16,11 @@ const GROUP = { '6X': '6', '7X': '7', FX: 'F', GS: 'S', FS: 'S', H: 'S', SS: 'SI
 const LABEL = { GS: 'S', FS: 'S', H: 'S', SI: 'SIR', SS: 'SIR' };
 const ORDER = ['1', '2', '3', '4', '5', '6', '7', 'A', 'C', 'E', 'B', 'D', 'F', 'M', 'G', 'J', 'Z', 'L', 'N', 'Q', 'R', 'W', 'S', 'SI'];
 const RAIL_FEEDS = { LIRR: 'lirr%2Fgtfs-lirr', MNR: 'mnr%2Fgtfs-mnr' };
+// flux GTFS-rt de chaque ligne : seuls les flux des lignes allumées sont téléchargés
+const SUB_FEED = { '1': 'gtfs', '2': 'gtfs', '3': 'gtfs', '4': 'gtfs', '5': 'gtfs', '6': 'gtfs', '7': 'gtfs', S: ['gtfs', 'gtfs-ace'],
+  A: 'gtfs-ace', C: 'gtfs-ace', E: 'gtfs-ace', B: 'gtfs-bdfm', D: 'gtfs-bdfm', F: 'gtfs-bdfm', M: 'gtfs-bdfm', G: 'gtfs-g',
+  J: 'gtfs-jz', Z: 'gtfs-jz', L: 'gtfs-l', N: 'gtfs-nqrw', Q: 'gtfs-nqrw', R: 'gtfs-nqrw', W: 'gtfs-nqrw', SI: 'gtfs-si' };
+const LEGEND_ROWS = [['1', '2', '3'], ['4', '5', '6'], ['7'], ['A', 'C', 'E'], ['B', 'D', 'F', 'M'], ['G'], ['J', 'Z'], ['L'], ['N', 'Q', 'R', 'W'], ['S', 'SI']];
 
 let S = null, R = null;      // données statiques métro / trains régionaux
 let stationById = {};
@@ -23,12 +29,14 @@ let trains = new Map();      // métro
 let rail = new Map();        // LIRR / MNR
 let alerts = [];
 let clockOffset = 0;
-let selLine = null;          // groupe de ligne affiché dans le panneau
-let railOn = { LIRR: true, MNR: true };
+const active = new Set();     // lignes de métro allumées (groupes) : tout est éteint au départ
+const railActive = new Set(); // branches régionales allumées : "LIRR:1", "MNR:2"…
+let focus = null;             // ligne détaillée dans le panneau de droite
 let mode = 'plan';
 let popupTrain = null, cardKind = null;
 let cabTrain = null, cabBearing = null;
-let lastData = 0, statusErr = '';
+const feedState = new Map();  // flux -> { ts, at, err, loading }
+let railGeo = [];             // tracés régionaux préparés pour le calage des positions GPS
 
 const nowS = () => Date.now() / 1000 + clockOffset;
 const routeOf = (r) => S.routes[r] || S.routes[GROUP[r]] || { color: '#808183', text: '#ffffff', name: r, long: '' };
@@ -206,102 +214,202 @@ async function loadStatic() {
   }
 }
 
-let source = new URLSearchParams(location.search).get('src') || 'direct';
-async function getSnapshot() {
-  if (source === 'direct') {
-    const snap = await GTFSRT.snapshot();
-    if (snap.trains.length || snap.errors.length < GTFSRT.FEEDS.length) return snap;
-    console.warn('MTA injoignable en direct, bascule sur le relais', snap.errors);
-    source = 'api';
+// ---------- flux temps réel : uniquement ceux des lignes allumées
+function neededFeeds() {
+  const f = new Set();
+  for (const g of active) for (const x of [].concat(SUB_FEED[g] || [])) f.add('nyct%2F' + x);
+  for (const k of railActive) f.add(RAIL_FEEDS[k.split(':')[0]]);
+  return f;
+}
+const agOfFeed = (name) => Object.keys(RAIL_FEEDS).find((a) => RAIL_FEEDS[a] === name);
+
+// le navigateur interroge la MTA directement ; en secours, le relais du serveur local (?src=api)
+let viaRelay = new URLSearchParams(location.search).get('src') === 'api';
+async function fetchFeedAny(name) {
+  if (viaRelay) return GTFSRT.fetchFeed(name, 'api/feed/');
+  try { return await GTFSRT.fetchFeed(name); }
+  catch (e) {
+    try { const f = await GTFSRT.fetchFeed(name, 'api/feed/'); viaRelay = true; return f; } catch { throw e; }
   }
-  const res = await fetch('api/trains', { cache: 'no-store' });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.status);
-  return data;
 }
 
-async function refresh() {
+let pollTimer = null;
+function schedulePoll(delay = 0) {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) await poll();
+    schedulePoll(POLL_MS);
+  }, delay);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) schedulePoll(0); });
+
+async function poll() {
+  const need = neededFeeds();
+  for (const [id, tr] of trains) if (!need.has(tr.feed)) trains.delete(id);
+  for (const [id, t] of rail) if (!need.has(RAIL_FEEDS[t.ag])) rail.delete(id);
+  for (const f of [...feedState.keys()]) if (!need.has(f)) feedState.delete(f);
+  await Promise.all([...need].map(loadFeed));
+}
+
+async function loadFeed(name) {
+  let st = feedState.get(name);
+  if (!st) feedState.set(name, (st = { ts: 0, at: 0, err: null, loading: false }));
+  if (st.loading) return;
+  st.loading = true; renderLegendState();
   try {
-    const data = await getSnapshot();
-    // horloge locale (le relais peut servir un instantané vieux de 15 s : ne pas recaler dessus)
-    const now = nowS();
-    const seen = new Set();
-    for (const t of data.trains) {
-      seen.add(t.id);
-      const old = trains.get(t.id);
-      const tr = { ...t, head: old && old.head, shown: old && old.shown, off: 0, offAt: now, offDur: 20 };
-      tr.tl = buildTimeline(t, now);
-      if (old && old.shown && tr.tl) {
-        // instant de la nouvelle frise où la rame est là où on l'affiche déjà : aucune téléportation,
-        // l'écart est rattrapé en accélérant ou ralentissant doucement (jamais de marche arrière)
-        const dist = (dt) => { const q = position(tr, now + dt); if (!q) return Infinity; const h = q.dir || tr.head; return seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7; };
-        let best = 0, bd = dist(0);
-        if (bd > 0.00005) for (let dt = -150; dt <= 150; dt += 3) {
-          const q = position(tr, now + dt);
-          if (!q) continue;
-          const h = q.dir || tr.head;
-          const d = seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7;
-          if (d < bd) { bd = d; best = dt; }
-        }
-        if (bd > 0.00005) for (let dt = best - 3; dt <= best + 3; dt += 0.2) { // affinage
-          const q = position(tr, now + dt);
-          if (!q) continue;
-          const h = q.dir || tr.head;
-          const d = seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7;
-          if (d < bd) { bd = d; best = dt; }
-        }
-        if (bd < 0.006) { tr.off = best; tr.offDur = Math.max(20, Math.abs(best) * 1.5); }
-      }
-      trains.set(t.id, tr);
-    }
-    for (const id of trains.keys()) if (!seen.has(id)) trains.delete(id);
-    lastData = data.feedTs || data.now;
-    statusErr = data.errors.length ? `${data.errors.length} flux métro en erreur` : '';
+    const feed = await fetchFeedAny(name);
+    if (!neededFeeds().has(name)) return;     // ligne éteinte entre-temps
+    st.err = null; st.at = nowS();
+    if (st.ts && feed.timestamp === st.ts) return; // flux inchangé : on laisse les rames filer
+    st.ts = feed.timestamp || Math.floor(st.at);
+    const ag = agOfFeed(name);
+    if (ag) ingestRail(ag, feed); else ingestSubway(name, feed);
   } catch (e) {
-    statusErr = 'Flux MTA injoignable (' + e.message + ')';
+    st.err = e.message || 'erreur';
+    console.warn('flux', name, e);
+  } finally {
+    st.loading = false; renderLegendState();
   }
 }
 
-async function refreshRail() {
-  for (const [ag, path] of Object.entries(RAIL_FEEDS)) {
-    try {
-      const feed = await GTFSRT.fetchFeed(path);
-      const now = nowS();
-      const tus = new Map();
-      for (const tu of feed.trips) if (tu.trip) { tus.set(tu.trip.trip_id, tu); if (tu.eid) tus.set('e' + tu.eid, tu); }
-      const seen = new Set();
-      for (const v of feed.vehicles) {
-        if (!v.position || !v.position.lat) continue;
-        const id = ag + ':' + (v.eid || (v.trip && v.trip.trip_id));
-        seen.add(id);
-        const tu = (v.trip && tus.get(v.trip.trip_id)) || tus.get('e' + v.eid) || null;
-        const routeId = (v.trip && v.trip.route_id) || (tu && tu.trip.route_id) || '';
-        const stops = tu ? tu.stops : [];
-        const lastStop = stops.length ? stops[stops.length - 1].stop_id : null;
-        const nextStop = stops.find((u) => (u.arrival || u.departure || 0) >= now - 30);
-        const delay = nextStop ? (nextStop.arr_delay ?? nextStop.dep_delay ?? null) : (tu ? tu.delay ?? null : null);
-        const num = ag === 'MNR' ? (v.eid || (v.vehicle && v.vehicle.label)) : ((v.trip && v.trip.trip_id) || '').split('_').pop();
-        const cur = [v.position.lon, v.position.lat];
-        const old = rail.get(id);
-        const moved = old && (old.cur[0] !== cur[0] || old.cur[1] !== cur[1]);
-        rail.set(id, {
-          id, ag, routeId, num, delay, dest: lastStop, next: nextStop ? nextStop.stop_id : null,
-          nextT: nextStop ? (nextStop.arrival || nextStop.departure) : null,
-          prev: old ? (moved ? old.shownP || old.cur : old.prev) : cur, cur,
-          t0: moved || !old ? now : old.t0,
-          dir: moved ? [cur[0] - old.cur[0], cur[1] - old.cur[1]] : (old ? old.dir : null),
-          bearing: v.position.bearing, shownP: old ? old.shownP : cur,
-        });
-      }
-      for (const id of [...rail.keys()]) if (id.startsWith(ag + ':') && !seen.has(id)) rail.delete(id);
-    } catch (e) {
-      console.warn('rail', ag, e);
-    }
+function ingestSubway(name, feed) {
+  const now = nowS();
+  const seen = new Set();
+  for (const t of GTFSRT.trainsFromFeed(feed)) { seen.add(t.id); ingestTrain(t, now, name); }
+  for (const [id, tr] of trains) if (tr.feed === name && !seen.has(id)) trains.delete(id);
+}
+
+function ingestTrain(t, now, feedName) {
+  const old = trains.get(t.id);
+  const tr = { ...t, feed: feedName, head: old && old.head, shown: old && old.shown, off: 0, offAt: now, offDur: 20 };
+  tr.tl = buildTimeline(t, now);
+  if (old && old.shown && tr.tl) {
+    // instant de la nouvelle frise où la rame est là où on l'affiche déjà : aucune téléportation,
+    // l'écart est rattrapé en accélérant ou ralentissant doucement (jamais de marche arrière)
+    const dist = (dt) => {
+      const q = position(tr, now + dt);
+      if (!q) return Infinity;
+      const h = q.dir || tr.head;
+      return seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7;
+    };
+    let best = 0, bd = dist(0);
+    if (bd > 0.00005) for (let dt = -150; dt <= 150; dt += 3) { const d = dist(dt); if (d < bd) { bd = d; best = dt; } }
+    if (bd > 0.00005) for (let dt = best - 3; dt <= best + 3; dt += 0.2) { const d = dist(dt); if (d < bd) { bd = d; best = dt; } }
+    if (bd < 0.006) { tr.off = best; tr.offDur = Math.max(20, Math.abs(best) * 1.5); }
   }
+  trains.set(t.id, tr);
+}
+
+// ---------- trains régionaux : GPS calé sur les voies, puis avance à la vitesse mesurée entre deux relevés
+function prepRailGeo() {
+  railGeo = R.lines.map((l) => {
+    const cum = [0];
+    for (let i = 1; i < l.p.length; i++) cum.push(cum[i - 1] + seglen(l.p[i - 1], l.p[i]));
+    return { a: l.a, r: String(l.r), pts: l.p, cum, len: cum[cum.length - 1] };
+  });
+}
+
+function snapRail(p, ag, routeId) {
+  let best = null;
+  for (let pass = 0; pass < 2 && !best; pass++) {
+    railGeo.forEach((L, li) => {
+      if (L.a !== ag || (pass === 0 && routeId && L.r !== routeId)) return;
+      for (let i = 1; i < L.pts.length; i++) {
+        const A = L.pts[i - 1], B = L.pts[i];
+        const ax = (B[0] - A[0]) * KX, ay = B[1] - A[1], px = (p[0] - A[0]) * KX, py = p[1] - A[1];
+        const l2 = ax * ax + ay * ay;
+        const u = l2 ? Math.max(0, Math.min(1, (px * ax + py * ay) / l2)) : 0;
+        const dx = px - ax * u, dy = py - ay * u, d = dx * dx + dy * dy;
+        if (!best || d < best.d) best = { d, li, s: L.cum[i - 1] + (L.cum[i] - L.cum[i - 1]) * u };
+      }
+    });
+    if (best && Math.sqrt(best.d) * M_LAT > 250) best = null; // trop loin d'un tracé connu : GPS brut
+  }
+  return best;
+}
+
+function alongLine(L, s) {
+  let lo = 1, hi = L.cum.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (L.cum[m] < s) lo = m + 1; else hi = m; }
+  const a = L.pts[lo - 1], b = L.pts[lo];
+  const span = L.cum[lo] - L.cum[lo - 1] || 1;
+  const u = Math.max(0, Math.min(1, (s - L.cum[lo - 1]) / span));
+  return { p: [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u], dir: [b[0] - a[0], b[1] - a[1]] };
+}
+
+// position affichée d'un train GPS (sans le rattrapage)
+function railModel(t, now) {
+  const f = t.fix;
+  if (f.li == null) return { p: f.p, dir: null };
+  const L = railGeo[f.li];
+  const dt = Math.max(0, Math.min(now - f.t, t.maxEx));
+  const q = alongLine(L, Math.max(0, Math.min(L.len, f.s + t.v * dt)));
+  return { p: q.p, dir: t.v < 0 ? [-q.dir[0], -q.dir[1]] : t.v > 0 ? q.dir : null };
+}
+
+function railPos(t, now) {
+  const m = railModel(t, now);
+  const k = Math.max(0, 1 - (now - t.corrAt) / t.corrDur);
+  const e = k * k * (3 - 2 * k);
+  return { p: [m.p[0] + t.corr[0] * e, m.p[1] + t.corr[1] * e], dir: m.dir };
+}
+
+function ingestRail(ag, feed) {
+  const now = nowS();
+  const tus = new Map();
+  for (const tu of feed.trips) if (tu.trip) { tus.set(tu.trip.trip_id, tu); if (tu.eid) tus.set('e' + tu.eid, tu); }
+  const seen = new Set();
+  for (const v of feed.vehicles) {
+    if (!v.position || !v.position.lat) continue;
+    const id = ag + ':' + (v.eid || (v.trip && v.trip.trip_id));
+    seen.add(id);
+    const tu = (v.trip && tus.get(v.trip.trip_id)) || tus.get('e' + v.eid) || null;
+    const routeId = String((v.trip && v.trip.route_id) || (tu && tu.trip.route_id) || '');
+    const stops = tu ? tu.stops : [];
+    const lastStop = stops.length ? stops[stops.length - 1].stop_id : null;
+    const nextStop = stops.find((u) => (u.arrival || u.departure || 0) >= now - 30);
+    const meta = {
+      id, ag, routeId,
+      num: ag === 'MNR' ? (v.eid || (v.vehicle && v.vehicle.label)) : ((v.trip && v.trip.trip_id) || '').split('_').pop(),
+      delay: nextStop ? (nextStop.arr_delay ?? nextStop.dep_delay ?? null) : (tu ? tu.delay ?? null : null),
+      dest: lastStop, next: nextStop ? nextStop.stop_id : null, nextT: nextStop ? (nextStop.arrival || nextStop.departure) : null,
+      bearing: v.position.bearing,
+    };
+    const cur = [v.position.lon, v.position.lat];
+    const ft = Math.min(now, v.timestamp || feed.timestamp || now);
+    const old = rail.get(id);
+    if (old && old.raw[0] === cur[0] && old.raw[1] === cur[1]) { Object.assign(old, meta); continue; } // même relevé
+    const sn = snapRail(cur, ag, routeId);
+    const t = { ...meta, raw: cur, fix: sn ? { p: alongLine(railGeo[sn.li], sn.s).p, t: ft, li: sn.li, s: sn.s } : { p: cur, t: ft, li: null },
+      v: 0, maxEx: 0, corr: [0, 0], corrAt: now, corrDur: CORR_S, dir: old && old.dir, shownP: old && old.shownP };
+    if (old && old.fix) {
+      const dt = ft - old.fix.t;
+      if (dt > 2 && dt < 300 && sn && old.fix.li === sn.li) {
+        const v0 = (sn.s - old.fix.s) / dt, ms = Math.abs(v0) * M_LAT;
+        if (ms > 0.8 && ms < 45) { t.v = v0; t.maxEx = Math.min(60, dt * 1.2); }
+      }
+      if (old.shownP) {
+        const m = railModel(t, now);
+        const c = [old.shownP[0] - m.p[0], old.shownP[1] - m.p[1]];
+        const em = Math.hypot(c[0] * KX, c[1]) * M_LAT;
+        // écart rattrapé en douceur, d'autant plus lentement qu'il est grand (au plus 15 s)
+        if (em < 3000) { t.corr = c; t.corrDur = Math.max(CORR_S, Math.min(15, em / 40)); }
+      }
+    }
+    rail.set(id, t);
+  }
+  for (const id of [...rail.keys()]) if (id.startsWith(ag + ':') && !seen.has(id)) rail.delete(id);
+}
+
+const railKey = (t) => t.ag + ':' + t.routeId;
+function railVisible(t) {
+  if (railActive.has(railKey(t))) return true;
+  // branche inconnue des données statiques : visible dès qu'une branche de la compagnie est allumée
+  return !(R.routes[t.ag] || {})[t.routeId] && [...railActive].some((k) => k.startsWith(t.ag + ':'));
 }
 
 async function refreshAlerts() {
-  try { alerts = await GTFSRT.alerts(); if (selLine) renderLinePanel(true); }
+  try { alerts = await GTFSRT.alerts(); if (focus) renderLinePanel(true); }
   catch (e) { console.warn('alertes', e); }
 }
 
@@ -326,7 +434,7 @@ function addLayers() {
   }
 
   // trains régionaux, sous le métro
-  map.addSource('rail-lines', { type: 'geojson', data: { type: 'FeatureCollection', features: R.lines.map((l) => ({ type: 'Feature', properties: { a: l.a, c: l.c }, geometry: { type: 'LineString', coordinates: l.p } })) } });
+  map.addSource('rail-lines', { type: 'geojson', data: { type: 'FeatureCollection', features: R.lines.map((l) => ({ type: 'Feature', properties: { a: l.a, k: l.a + ':' + l.r, c: l.c }, geometry: { type: 'LineString', coordinates: l.p } })) } });
   map.addLayer({ id: 'rail-lines-casing', type: 'line', source: 'rail-lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': ['interpolate', ['linear'], ['zoom'], 9, 2.4, 14, 6], 'line-opacity': 0.7 } });
   map.addLayer({ id: 'rail-lines', type: 'line', source: 'rail-lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': ['get', 'c'], 'line-width': ['interpolate', ['linear'], ['zoom'], 9, 1, 14, 2.6], 'line-opacity': 0.55, 'line-dasharray': [3, 1.5] } });
   const railSt = [];
@@ -374,7 +482,7 @@ function handleClick(pt) {
   f = hit(['stations']);
   if (f.length) return openStation(f[0].properties.id);
   f = hit(['lines']);
-  if (f.length && !selLine) return selectLine(f[0].properties.g);
+  if (f.length) { const g = f[0].properties.g; return active.has(g) ? setFocus(g) : toggleLine(g); }
   hideCard();
 }
 
@@ -420,7 +528,7 @@ function dimBase(on) {
 function setMode(m) {
   if (m === 'cab' && !cabTrain) {
     cabTrain = pickCabTrain();
-    if (!cabTrain) return;
+    if (!cabTrain) return toast(active.size ? 'Aucune rame en marche près du centre de la carte' : 'Allume d\'abord une ligne de métro');
   }
   mode = m;
   document.querySelectorAll('.modes button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
@@ -433,7 +541,7 @@ function setMode(m) {
     map.setPaintProperty('buildings-3d', 'fill-extrusion-opacity', m === 'under' ? 0.16 : 0.88);
   }
   map.setLayoutProperty('trains-3d', 'visibility', three ? 'visible' : 'none');
-  map.setLayoutProperty('lines-glow', 'visibility', m === 'under' || selLine ? 'visible' : 'none');
+  map.setLayoutProperty('lines-glow', 'visibility', m === 'under' || focus ? 'visible' : 'none');
   const fade = three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1;
   map.setPaintProperty('trains', 'icon-opacity', fade);
   map.setPaintProperty('train-labels', 'text-opacity', fade);
@@ -449,7 +557,7 @@ function pickCabTrain() {
   const c = map.getCenter();
   let best = null, bd = Infinity;
   for (const tr of trains.values()) {
-    if (!tr.shown || (selLine && group(tr.r) !== selLine)) continue;
+    if (!tr.shown || !active.has(group(tr.r))) continue;
     const d = seglen(tr.shown, [c.lng, c.lat]);
     if (d < bd && tr.moving) { bd = d; best = tr.id; }
   }
@@ -551,25 +659,79 @@ function statusColor(rank) {
   return '#4a90e2';
 }
 
-function selectLine(g) {
-  selLine = selLine === g ? null : g;
-  document.querySelectorAll('#legend .bullet').forEach((b) => { b.classList.toggle('sel', b.dataset.g === selLine); b.classList.toggle('dim', !!selLine && b.dataset.g !== selLine); });
-  const op = (on, off) => (selLine ? ['case', ['==', ['get', 'g'], selLine], on, off] : on);
-  map.setPaintProperty('lines', 'line-opacity', op(1, 0));
-  map.setPaintProperty('lines-casing', 'line-opacity', op(1, 0));
-  map.setPaintProperty('lines', 'line-width', selLine ? ['interpolate', ['linear'], ['zoom'], 10, 3.5, 14, 7, 17, 12, 21, 48] : ['interpolate', ['linear'], ['zoom'], 10, 1.6, 14, 3.6, 17, 8, 21, 48]);
-  map.setPaintProperty('lines-casing', 'line-width', selLine ? ['interpolate', ['linear'], ['zoom'], 10, 6, 14, 11, 17, 18, 21, 60] : ['interpolate', ['linear'], ['zoom'], 10, 3, 14, 7, 17, 13, 21, 60]);
-  map.setPaintProperty('lines-glow', 'line-opacity', op(0.5, 0));
-  map.setLayoutProperty('lines-glow', 'visibility', mode === 'under' || selLine ? 'visible' : 'none');
-  const stf = selLine ? ['in', ',' + selLine + ',', ['get', 'gs']] : null;
+// ---------- sélection des lignes : rien n'est allumé au départ, chaque ligne allumée passe en direct
+const GREY = '#3a3d44';
+function applyLineStyle() {
+  const act = ['literal', [...active]];
+  const on = ['in', ['get', 'g'], act];
+  map.setPaintProperty('lines', 'line-color', ['case', on, ['get', 'c'], GREY]);
+  map.setPaintProperty('lines', 'line-width', ['interpolate', ['linear'], ['zoom'],
+    10, ['case', on, 2.6, 0.8], 14, ['case', on, 5, 1.6], 17, ['case', on, 10, 3], 21, ['case', on, 48, 10]]);
+  map.setPaintProperty('lines-casing', 'line-opacity', ['case', on, 1, 0]);
+  map.setPaintProperty('lines-casing', 'line-width', ['interpolate', ['linear'], ['zoom'], 10, 5, 14, 9, 17, 16, 21, 60]);
+  map.setLayoutProperty('lines', 'line-sort-key', ['case', on, 1, 0]);
+  map.setPaintProperty('lines-glow', 'line-opacity', focus ? ['case', ['==', ['get', 'g'], focus], 0.5, 0] : 0);
+  map.setLayoutProperty('lines-glow', 'visibility', mode === 'under' || focus ? 'visible' : 'none');
+  const stf = active.size ? ['any', ...[...active].map((g) => ['in', ',' + g + ',', ['get', 'gs']])] : ['in', ',-,', ['get', 'gs']];
   map.setFilter('stations', stf); map.setFilter('station-names', stf);
-  map.setLayerZoomRange('station-names', selLine ? 11.5 : 13.5, 24);
-  for (const l of ['rail-lines', 'rail-lines-casing', 'rail-stations', 'rail-names']) map.setLayoutProperty(l, 'visibility', selLine ? 'none' : 'visible');
+  // régional : branches allumées en couleur, les autres en gris
+  const ron = ['in', ['get', 'k'], ['literal', [...railActive]]];
+  map.setPaintProperty('rail-lines', 'line-color', ['case', ron, ['get', 'c'], GREY]);
+  map.setPaintProperty('rail-lines', 'line-opacity', ['case', ron, 0.95, 0.6]);
+  map.setPaintProperty('rail-lines', 'line-width', ['interpolate', ['linear'], ['zoom'], 9, ['case', ron, 1.6, 0.7], 14, ['case', ron, 3.6, 1.4]]);
+  map.setPaintProperty('rail-lines-casing', 'line-opacity', ['case', ron, 0.8, 0]);
+  const ags = [...new Set([...railActive].map((k) => k.split(':')[0]))];
+  const rsf = ['in', ['get', 'a'], ['literal', ags]];
+  map.setFilter('rail-stations', rsf); map.setFilter('rail-names', rsf);
+}
+
+function linesChanged() {
+  applyLineStyle();
+  renderLegendState();
+  syncUrl();
+  schedulePoll(100);
+}
+
+function toggleLine(g) {
+  if (active.has(g)) {
+    active.delete(g);
+    if (focus === g) setFocus([...active].pop() || null, false);
+  } else {
+    active.add(g);
+    setFocus(g, true);
+  }
+  linesChanged();
+}
+
+function setLines(list) {
+  active.clear();
+  for (const g of list) active.add(g);
+  if (!active.has(focus)) setFocus(null);
+  linesChanged();
+}
+
+function toggleBranch(k) {
+  railActive.has(k) ? railActive.delete(k) : railActive.add(k);
+  linesChanged();
+}
+
+function toggleAgency(ag) {
+  const keys = Object.keys(R.routes[ag]).map((r) => ag + ':' + r);
+  const any = keys.some((k) => railActive.has(k));
+  for (const k of keys) any ? railActive.delete(k) : railActive.add(k);
+  linesChanged();
+}
+
+// ligne détaillée dans le panneau (trajet complet + trafic) ; fit = recadrer la carte dessus
+function setFocus(g, fit = false) {
+  focus = g;
+  applyLineStyle();
+  renderLegendState();
+  document.getElementById('line-panel').classList.toggle('closed', !focus);
+  if (!focus) return;
   hideCard();
-  document.getElementById('line-panel').classList.toggle('closed', !selLine);
-  if (!selLine) return;
-  const pat = linePattern(selLine);
-  if (pat.length) {
+  const pat = linePattern(focus);
+  if (fit && pat.length && mode !== 'cab') {
     const b = new maplibregl.LngLatBounds();
     for (const id of pat) { const s = stationById[id]; if (s) b.extend([s.lon, s.lat]); }
     const wide = window.innerWidth > 700;
@@ -578,16 +740,41 @@ function selectLine(g) {
   stripPat = null;
   renderLinePanel(false);
 }
+window.selectLine = (g) => (active.has(g) ? setFocus(g, true) : toggleLine(g));
+
+function syncUrl() {
+  const q = new URLSearchParams(location.search);
+  q.delete('line');
+  active.size ? q.set('lines', [...active].join(',')) : q.delete('lines');
+  railActive.size ? q.set('rail', [...railActive].join(',')) : q.delete('rail');
+  const qs = q.toString().replace(/%2C/g, ',').replace(/%3A/g, ':');
+  history.replaceState(history.state, '', location.pathname + (qs ? '?' + qs : '') + location.hash);
+}
+
+let toastT = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.remove('closed');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => el.classList.add('closed'), 3200);
+}
 
 let stripPat = null;
 function renderLinePanel(soft) {
-  if (!selLine) return;
-  const r = selLine === 'S' ? 'GS' : selLine;
+  if (!focus) return;
+  const r = focus === 'S' ? 'GS' : focus;
   const info = routeOf(r);
-  const pat = linePattern(selLine);
+  const pat = linePattern(focus);
+  const tabs = document.getElementById('lineTabs');
+  tabs.innerHTML = active.size > 1 ? [...active].sort((x, y) => ORDER.indexOf(x) - ORDER.indexOf(y)).map((g) => {
+    const rr = g === 'S' ? 'GS' : g;
+    return `<button class="bullet sm${g === focus ? ' cur' : ''}" data-g="${g}" style="background:${routeColor(rr)};color:${routeText(rr)}" title="${esc(routeOf(rr).long || '')}"><span>${label(rr)}</span></button>`;
+  }).join('') : '';
+  tabs.querySelectorAll('button').forEach((b) => (b.onclick = () => setFocus(b.dataset.g, true)));
   const head = document.getElementById('lineHead');
   head.innerHTML = `${bulletHtml(r, 'lg')}<div><div class="name">${esc(info.long || info.name)}</div><div class="sub">${pat.length} stations · ${esc((stationById[pat[0]] || {}).name || '')} ↔ ${esc((stationById[pat[pat.length - 1]] || {}).name || '')}</div></div>`;
-  const al = lineStatus(selLine);
+  const al = lineStatus(focus);
   const top = al[0];
   document.getElementById('lineStatus').innerHTML = `<span class="dot" style="background:${statusColor(top && top.rank)}"></span>${top ? esc(top.status || 'Alerte') : 'Good Service'}<span style="margin-left:auto;font-weight:400;color:var(--muted);font-size:11px">${al.length ? al.length + ' alerte' + (al.length > 1 ? 's' : '') : ''}</span>`;
   document.getElementById('lineAlerts').innerHTML = al.slice(0, 6).map((a) => `<details><summary><b>${esc(a.status)}</b>${esc(a.header)}</summary>${a.description ? `<p>${esc(a.description)}</p>` : ''}</details>`).join('');
@@ -607,14 +794,14 @@ function renderLinePanel(soft) {
 }
 
 function updateStrip() {
-  if (!selLine || !stripPat) return;
+  if (!focus || !stripPat) return;
   const marks = document.getElementById('marks');
   if (!marks) return;
   const idx = new Map(stripPat.map((id, i) => [id, i]));
   const H = 24;
   let n = 0, s = 0, html = '';
   for (const tr of trains.values()) {
-    if (group(tr.r) !== selLine || !tr.pos) continue;
+    if (group(tr.r) !== focus || !tr.pos) continue;
     const p = tr.pos;
     const a = idx.get(p.from), b = idx.get(p.next);
     let y;
@@ -630,42 +817,91 @@ function updateStrip() {
 }
 
 // ---------- légende et boutons
+const shortBranch = (n) => n.replace(/ Branch$/, '').replace(/ Service$/, '');
 function buildLegend() {
   const el = document.getElementById('legend');
   el.innerHTML = '';
-  for (const g of ORDER) {
-    const r = g === 'S' ? 'GS' : g;
-    if (!S.routes[r]) continue;
-    const b = document.createElement('button');
-    b.className = 'bullet';
-    b.dataset.g = g;
-    b.style.background = routeColor(r);
-    b.style.color = routeText(r);
-    b.innerHTML = `<span>${label(r)}</span><span class="n"></span>`;
-    b.title = S.routes[r].long || '';
-    b.onclick = () => selectLine(g);
-    el.appendChild(b);
+  for (const row of LEGEND_ROWS) {
+    const grp = document.createElement('div');
+    grp.className = 'lg-grp';
+    for (const g of row) {
+      const r = g === 'S' ? 'GS' : g;
+      if (!S.routes[r]) continue;
+      const b = document.createElement('button');
+      b.className = 'bullet tog';
+      b.dataset.g = g;
+      b.style.setProperty('--c', routeColor(r));
+      b.style.setProperty('--t', routeText(r));
+      b.innerHTML = `<span>${label(r)}</span><span class="n"></span>`;
+      b.title = (S.routes[r].long || '') + ' : allumer / éteindre';
+      b.setAttribute('aria-pressed', 'false');
+      b.onclick = () => toggleLine(g);
+      grp.appendChild(b);
+    }
+    el.appendChild(grp);
   }
-  document.querySelectorAll('.rail-toggle').forEach((b) => (b.onclick = () => {
-    railOn[b.dataset.a] = !railOn[b.dataset.a];
-    b.classList.toggle('on', railOn[b.dataset.a]);
-    const ags = Object.keys(railOn).filter((a) => railOn[a]);
-    const f = ['in', ['get', 'a'], ['literal', ags]];
-    for (const l of ['rail-lines', 'rail-lines-casing', 'rail-stations', 'rail-names']) map.setFilter(l, f);
-  }));
+  document.getElementById('allSub').onclick = () => setLines(ORDER.filter((g) => S.routes[g === 'S' ? 'GS' : g]));
+  document.getElementById('noneSub').onclick = () => setLines([]);
+
+  const rl = document.getElementById('rail-legend');
+  rl.innerHTML = '';
+  for (const ag of ['LIRR', 'MNR']) {
+    const box = document.createElement('div');
+    box.className = 'rail-ag';
+    const full = ag === 'LIRR' ? 'Long Island Rail Road' : 'Metro-North';
+    box.innerHTML = `<button class="rail-master" data-a="${ag}"><span class="rail-chip ${ag.toLowerCase()}">${ag}</span><span>${full}</span><span class="state"></span></button><div class="branches"></div>`;
+    const br = box.querySelector('.branches');
+    const routes = Object.entries(R.routes[ag]).sort((x, y) => x[1].name.localeCompare(y[1].name));
+    for (const [rid, info] of routes) {
+      const b = document.createElement('button');
+      b.className = 'branch';
+      b.dataset.k = ag + ':' + rid;
+      b.style.setProperty('--c', info.color);
+      b.innerHTML = `<i></i>${esc(shortBranch(info.name))}<span class="cnt"></span>`;
+      b.onclick = () => toggleBranch(b.dataset.k);
+      br.appendChild(b);
+    }
+    box.querySelector('.rail-master').onclick = () => toggleAgency(ag);
+    rl.appendChild(box);
+  }
+
   document.querySelectorAll('.modes button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
-  document.getElementById('lineClose').onclick = () => selectLine(selLine);
+  document.getElementById('lineClose').onclick = () => setFocus(null);
   document.getElementById('collapse').onclick = () => document.getElementById('panel').classList.toggle('collapsed');
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (cardKind) hideCard(); else if (mode === 'cab') setMode('3d'); else if (selLine) selectLine(selLine);
+    if (cardKind) hideCard(); else if (mode === 'cab') setMode('3d'); else if (focus) setFocus(null);
   });
   setupOrbit();
   document.getElementById('cabExit').onclick = () => setMode('3d');
   document.getElementById('cabNext').onclick = () => {
-    const ids = [...trains.values()].filter((t) => t.moving && t.id !== cabTrain && (!selLine || group(t.r) === selLine)).map((t) => t.id);
+    const ids = [...trains.values()].filter((t) => t.moving && t.id !== cabTrain && active.has(group(t.r))).map((t) => t.id);
     if (ids.length) { cabTrain = ids[Math.floor(Math.random() * ids.length)]; cabBearing = null; }
   };
+}
+
+// état visuel des pastilles et des branches (allumée, en chargement, ligne détaillée)
+function renderLegendState() {
+  const loadingFeeds = new Set([...feedState].filter(([, st]) => st.loading && !st.ts).map(([f]) => f));
+  document.querySelectorAll('#legend .bullet').forEach((b) => {
+    const g = b.dataset.g, on = active.has(g);
+    b.classList.toggle('on', on);
+    b.classList.toggle('focus', g === focus);
+    b.setAttribute('aria-pressed', on);
+    b.classList.toggle('loading', on && [].concat(SUB_FEED[g] || []).some((f) => loadingFeeds.has('nyct%2F' + f)));
+  });
+  document.querySelectorAll('.branch').forEach((b) => {
+    const on = railActive.has(b.dataset.k);
+    b.classList.toggle('on', on);
+    b.classList.toggle('loading', on && loadingFeeds.has(RAIL_FEEDS[b.dataset.k.split(':')[0]]));
+  });
+  document.querySelectorAll('.rail-master').forEach((b) => {
+    const ag = b.dataset.a, keys = Object.keys(R.routes[ag]).map((r) => ag + ':' + r);
+    const n = keys.filter((k) => railActive.has(k)).length;
+    b.classList.toggle('on', n > 0);
+    b.querySelector('.state').textContent = n === 0 ? 'tout allumer' : n === keys.length ? 'tout éteindre' : `${n}/${keys.length} · éteindre`;
+  });
+  document.getElementById('emptyHint').classList.toggle('hidden', active.size + railActive.size > 0);
 }
 
 // En 3D : glisser = tourner autour du centre et incliner ; Maj + glisser = se déplacer
@@ -713,20 +949,21 @@ function frame(ts) {
     tr.moving = !!pos.dir && !pos.still;
     const p = tr.head ? offsetRight(pos.p, tr.head, sideM) : pos.p;
     tr.shown = p;
+    if (!active.has(g)) continue;
     perGroup[g] = (perGroup[g] || 0) + 1;
-    if (selLine && g !== selLine) continue;
     const c = routeColor(tr.r);
     if (mode === 'cab' && tr.id === cabTrain) continue;
     feats.push({ type: 'Feature', properties: { k: 'm', id: tr.id, c, t: routeText(tr.r), l: label(tr.r), g, i: 'sub-' + c, b: tr.head ? bearingOf(tr.head) : 0, sel: tr.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
     if (three && tr.head && !(mode === 'cab' && tr.id === cabTrain)) { const [n, len] = CARS[tr.r] || [10, 18.3]; pushCars(boxes, p, tr.head, n, len, c, tr.id, 'm'); }
   }
-  let nRail = 0;
+  const perBranch = {};
   for (const t of rail.values()) {
-    const u = Math.min(1, (now - t.t0) / (REFRESH_MS / 1000));
-    const p = [t.prev[0] + (t.cur[0] - t.prev[0]) * u, t.prev[1] + (t.cur[1] - t.prev[1]) * u];
+    const q = railPos(t, now);
+    const p = q.p;
     t.shownP = p;
-    if (!railOn[t.ag] || selLine) continue;
-    nRail++;
+    if (q.dir) t.dir = q.dir;
+    if (!railVisible(t)) continue;
+    perBranch[railKey(t)] = (perBranch[railKey(t)] || 0) + 1;
     const c = railRoute(t).color;
     const dir = t.dir || (t.bearing != null ? [Math.sin(t.bearing * Math.PI / 180) / KX, Math.cos(t.bearing * Math.PI / 180)] : null);
     feats.push({ type: 'Feature', properties: { k: 'r', id: t.id, c, i: 'rail-' + c, b: dir ? bearingOf(dir) : 0, sel: t.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
@@ -735,7 +972,7 @@ function frame(ts) {
   map.getSource('trains').setData({ type: 'FeatureCollection', features: feats });
   if (three) map.getSource('trains3d').setData({ type: 'FeatureCollection', features: boxes });
   if (mode === 'cab') cabCamera();
-  if (ts - lastHud > 1000) { lastHud = ts; updateHud(now, perGroup, nRail); }
+  if (ts - lastHud > 1000) { lastHud = ts; updateHud(now, perGroup, perBranch); }
 }
 
 function cabCamera() {
@@ -756,16 +993,25 @@ function cabCamera() {
   map.jumpTo({ ...cam, pitch: Math.min(85, cam.pitch) });
 }
 
-function updateHud(now, perGroup, nRail) {
+function updateHud(now, perGroup, perBranch) {
   const d = new Date(now * 1000);
   document.getElementById('clock').textContent = d.toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' });
   document.getElementById('count').textContent = Object.values(perGroup).reduce((a, b) => a + b, 0);
-  document.getElementById('countRail').textContent = rail.size;
-  document.querySelectorAll('#legend .bullet').forEach((b) => { b.querySelector('.n').textContent = perGroup[b.dataset.g] || ''; });
+  document.getElementById('countRail').textContent = Object.values(perBranch).reduce((a, b) => a + b, 0);
+  document.querySelectorAll('#legend .bullet').forEach((b) => { b.querySelector('.n').textContent = active.has(b.dataset.g) ? (perGroup[b.dataset.g] ?? 0) : ''; });
+  document.querySelectorAll('.branch').forEach((b) => { b.querySelector('.cnt').textContent = railActive.has(b.dataset.k) ? (perBranch[b.dataset.k] ?? 0) : ''; });
+  // état du direct : âge des données MTA (horodatage du flux), flux en erreur
   const st = document.getElementById('status');
-  const age = lastData ? Math.max(0, Math.round(now - lastData)) : null;
-  st.className = statusErr ? 'err' : '';
-  st.textContent = statusErr || (age == null ? 'Chargement…' : `Temps réel MTA · mis à jour il y a ${age} s · heure de New York`);
+  const feeds = [...feedState.entries()];
+  const bad = feeds.filter(([, f]) => f.err).map(([n]) => n.split('%2F')[1]);
+  const ok = feeds.filter(([, f]) => f.ts);
+  if (!feeds.length) { st.className = 'idle'; st.innerHTML = 'Direct en pause : allume une ligne'; }
+  else if (!ok.length) { st.className = bad.length ? 'err' : ''; st.textContent = bad.length ? `Flux MTA injoignable (${bad.join(', ')})` : 'Connexion au direct MTA…'; }
+  else {
+    const age = Math.max(0, Math.round(now - Math.min(...ok.map(([, f]) => f.ts))));
+    st.className = bad.length ? 'err' : age > 90 ? 'stale' : 'live';
+    st.innerHTML = `<i class="dot"></i>${bad.length ? `${bad.length} flux en erreur (${esc(bad.join(', '))}) · ` : 'Direct MTA · '}données d'il y a ${age} s · ${ok.length} flux`;
+  }
   if (popupTrain && cardKind) {
     const tr = trains.get(popupTrain);
     if (tr && cardKind === 'train') showCard(trainHtml(tr), 'train');
@@ -784,15 +1030,21 @@ function updateHud(now, perGroup, nRail) {
 // ---------- démarrage
 (async function start() {
   await Promise.all([loadStatic(), new Promise((r) => map.once('load', r))]);
+  prepRailGeo();
   addLayers();
   buildLegend();
-  await Promise.all([refresh(), refreshRail()]);
+  // lignes allumées via l'URL (?lines=A,C&rail=LIRR:1,MNR), sinon tout est éteint
+  const q = new URLSearchParams(location.search);
+  for (const g of (q.get('lines') || q.get('line') || '').split(',')) if (g && SUB_FEED[g]) active.add(g);
+  for (const k of (q.get('rail') || '').split(',')) {
+    const [ag, r] = k.split(':');
+    if (!R.routes[ag]) continue;
+    for (const rid of r ? [r] : Object.keys(R.routes[ag])) if (R.routes[ag][rid]) railActive.add(ag + ':' + rid);
+  }
+  linesChanged();
+  if (active.size === 1) setFocus([...active][0], true);
   refreshAlerts();
-  setInterval(refresh, REFRESH_MS);
-  setInterval(refreshRail, REFRESH_MS);
   setInterval(refreshAlerts, ALERTS_MS);
   requestAnimationFrame(frame);
-  const q = new URLSearchParams(location.search);
-  if (q.get('line')) selectLine(q.get('line'));
-  if (q.get('mode')) setTimeout(() => setMode(q.get('mode')), 1200);
+  if (q.get('mode')) setTimeout(() => setMode(q.get('mode')), 2500);
 })();

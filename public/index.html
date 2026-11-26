@@ -6,7 +6,7 @@
 <title>NY Tube</title>
 <meta name="description" content="Le métro de New York, LIRR et Metro-North en temps réel sur une carte du grand Manhattan.">
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
-<link rel="stylesheet" href="style.css?v=202611262154">
+<link rel="stylesheet" href="style.css?v=202611262330">
 </head>
 <body>
 <div id="map"></div>
@@ -20,14 +20,13 @@
   <div id="stats"><span><b id="count">0</b> subway</span><span><b id="countRail">0</b> trains LIRR / MNR</span></div>
   <div id="status">Chargement…</div>
 
-  <h2>Subway <small>clic : la ligne et son trafic</small></h2>
+  <p id="emptyHint">Tout est éteint. Allume les lignes qui t'intéressent : leurs rames passent en direct.</p>
+
+  <h2>Subway <span class="acts"><button id="allSub">Tout</button><button id="noneSub">Aucun</button></span></h2>
   <div id="legend"></div>
 
-  <h2>Regional Rail</h2>
-  <div id="rail-legend">
-    <button class="rail-toggle on" data-a="LIRR"><span class="rail-chip lirr">LIRR</span> Long Island Rail Road</button>
-    <button class="rail-toggle on" data-a="MNR"><span class="rail-chip mnr">MNR</span> Metro-North</button>
-  </div>
+  <h2>Regional Rail <small>clic : une branche</small></h2>
+  <div id="rail-legend"></div>
 
   <h2>Vue</h2>
   <div class="modes" role="group" aria-label="Mode de vue">
@@ -41,6 +40,7 @@
 
 <aside id="line-panel" class="sign closed" aria-live="polite">
   <button class="close" id="lineClose" aria-label="Fermer">×</button>
+  <div id="lineTabs"></div>
   <header id="lineHead"></header>
   <div id="lineStatus"></div>
   <div id="lineAlerts"></div>
@@ -51,6 +51,7 @@
 <div id="cab-frame" aria-hidden="true"></div>
 <div id="hint" class="closed">Glisser : tourner et incliner · Maj + glisser : se déplacer</div>
 <aside id="card" class="sign closed" aria-live="polite"></aside>
+<div id="toast" class="closed" role="status"></div>
 <div id="cab-hud" class="sign closed">
   <div id="cabInfo"></div>
   <div class="row">
@@ -60,7 +61,7 @@
 </div>
 
 <script src="vendor/maplibre-gl.js"></script>
-<script src="lib/gtfsrt.js?v=202611262154"></script>
-<script src="app.js?v=202611262154"></script>
+<script src="lib/gtfsrt.js?v=202611262330"></script>
+<script src="app.js?v=202611262330"></script>
 </body>
 </html>

@@ -216,6 +216,31 @@ async function fetchFeed(path, base = BASE) {
 // Identifiant de station « parent » : le temps réel donne 127N / 127S
 const parentId = (s) => (s && /[NS]$/.test(s) ? s.slice(0, -1) : s);
 
+// Rames d'un flux métro décodé, au format compact utilisé par le front.
+function trainsFromFeed(feed) {
+  const veh = new Map();
+  for (const v of feed.vehicles) if (v.trip && v.trip.trip_id) veh.set(v.trip.trip_id, v);
+  const trains = [];
+  for (const tu of feed.trips) {
+    const t = tu.trip || {};
+    if (!t.trip_id || !tu.stops.length) continue;
+    const v = veh.get(t.trip_id) || {};
+    const last = tu.stops[tu.stops.length - 1].stop_id || '';
+    trains.push({
+      id: t.trip_id,
+      r: t.route_id,
+      d: t.direction === 3 ? 'S' : t.direction === 1 ? 'N' : last.slice(-1),
+      n: t.train_id || null,
+      a: t.is_assigned !== false,
+      st: v.status ?? null,
+      vs: parentId(v.stop_id) || null,
+      vt: v.timestamp || null,
+      s: tu.stops.slice(0, 40).map((u) => [parentId(u.stop_id), u.arrival || u.departure || 0, u.departure || u.arrival || 0, u.track || null]),
+    });
+  }
+  return trains;
+}
+
 // Interroge les 8 flux du métro (sans clé) et renvoie un instantané compact des rames.
 async function snapshot(base = BASE) {
   const results = await Promise.allSettled(FEEDS.map((name) => fetchFeed('nyct%2F' + name, base)));
@@ -224,27 +249,8 @@ async function snapshot(base = BASE) {
   let feedTs = 0;
   results.forEach((r, i) => {
     if (r.status !== 'fulfilled') { errors.push(FEEDS[i] + ': ' + (r.reason && r.reason.message)); return; }
-    const feed = r.value;
-    feedTs = Math.max(feedTs, feed.timestamp || 0);
-    const veh = new Map();
-    for (const v of feed.vehicles) if (v.trip && v.trip.trip_id) veh.set(v.trip.trip_id, v);
-    for (const tu of feed.trips) {
-      const t = tu.trip || {};
-      if (!t.trip_id || !tu.stops.length) continue;
-      const v = veh.get(t.trip_id) || {};
-      const last = tu.stops[tu.stops.length - 1].stop_id || '';
-      trains.push({
-        id: t.trip_id,
-        r: t.route_id,
-        d: t.direction === 3 ? 'S' : t.direction === 1 ? 'N' : last.slice(-1),
-        n: t.train_id || null,
-        a: t.is_assigned !== false,
-        st: v.status ?? null,
-        vs: parentId(v.stop_id) || null,
-        vt: v.timestamp || null,
-        s: tu.stops.slice(0, 40).map((u) => [parentId(u.stop_id), u.arrival || u.departure || 0, u.departure || u.arrival || 0, u.track || null]),
-      });
-    }
+    feedTs = Math.max(feedTs, r.value.timestamp || 0);
+    trains.push(...trainsFromFeed(r.value));
   });
   return { now: Math.floor(Date.now() / 1000), feedTs, errors, trains };
 }
@@ -270,7 +276,7 @@ async function alerts(path = 'camsys%2Fsubway-alerts', base = BASE) {
     });
 }
 
-const api = { decodeFeed, fetchFeed, snapshot, alerts, STATUS, FEEDS, BASE };
+const api = { decodeFeed, fetchFeed, trainsFromFeed, snapshot, alerts, STATUS, FEEDS, BASE };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 else root.GTFSRT = api;
 })(typeof self !== 'undefined' ? self : this);
