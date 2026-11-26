@@ -26,7 +26,7 @@ let clockOffset = 0;
 let selLine = null;          // groupe de ligne affiché dans le panneau
 let railOn = { LIRR: true, MNR: true };
 let mode = 'plan';
-let popup = null, popupTrain = null;
+let popupTrain = null, cardKind = null;
 let cabTrain = null, cabBearing = null;
 let lastData = 0, statusErr = '';
 
@@ -176,6 +176,8 @@ function position(tr, now) {
   return at(tl.length - 1);
 }
 
+const effTime = (tr, now) => now + tr.off * Math.max(0, 1 - (now - tr.offAt) / tr.offDur);
+
 // ---------- chargement
 async function loadStatic() {
   const [s, r] = await Promise.all([fetch('data/static.json').then((x) => x.json()), fetch('data/rail.json').then((x) => x.json())]);
@@ -221,7 +223,22 @@ async function refresh() {
     for (const t of data.trains) {
       seen.add(t.id);
       const old = trains.get(t.id);
-      trains.set(t.id, { ...t, tl: buildTimeline(t, now), shown: old && old.shown, head: old && old.head, blendFrom: old && old.shown, blendAt: now });
+      const tr = { ...t, head: old && old.head, shown: old && old.shown, off: 0, offAt: now, offDur: 20 };
+      tr.tl = buildTimeline(t, now);
+      if (old && old.shown && tr.tl) {
+        // instant de la nouvelle frise où la rame est là où on l'affiche déjà : aucune téléportation,
+        // l'écart est rattrapé en accélérant ou ralentissant doucement (jamais de marche arrière)
+        let best = 0, bd = Infinity;
+        for (let dt = -150; dt <= 150; dt += 2) {
+          const q = position(tr, now + dt);
+          if (!q) continue;
+          const h = q.dir || tr.head;
+          const d = seglen(h ? offsetRight(q.p, h) : q.p, old.shown) + Math.abs(dt) * 2e-7;
+          if (d < bd) { bd = d; best = dt; }
+        }
+        if (bd < 0.006) { tr.off = best; tr.offDur = Math.max(20, Math.abs(best) * 1.5); }
+      }
+      trains.set(t.id, tr);
     }
     for (const id of trains.keys()) if (!seen.has(id)) trains.delete(id);
     lastData = data.feedTs || data.now;
@@ -275,7 +292,7 @@ async function refreshAlerts() {
 }
 
 // ---------- carte
-const map = new maplibregl.Map({ container: 'map', style: STYLE, ...MANHATTAN, maxPitch: 85, attributionControl: { compact: true }, hash: true, antialias: true });
+const map = new maplibregl.Map({ container: 'map', style: STYLE, ...MANHATTAN, maxPitch: 85, maxZoom: 23, attributionControl: { compact: true }, hash: true, antialias: true });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
 let baseLayers = [];
 
@@ -306,10 +323,10 @@ function addLayers() {
   // métro
   map.addSource('lines', { type: 'geojson', data: { type: 'FeatureCollection', features: S.shapes.map((s) => ({ type: 'Feature', properties: { c: routeColor(s.route), g: group(s.route) }, geometry: { type: 'LineString', coordinates: s.p } })) } });
   map.addLayer({ id: 'lines-glow', type: 'line', source: 'lines', layout: { 'line-join': 'round', 'line-cap': 'round', visibility: 'none' }, paint: { 'line-color': ['get', 'c'], 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 6, 15, 22], 'line-opacity': 0.35, 'line-blur': 6 } });
-  map.addLayer({ id: 'lines-casing', type: 'line', source: 'lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 3, 14, 7, 17, 13] } });
-  map.addLayer({ id: 'lines', type: 'line', source: 'lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': ['get', 'c'], 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 1.6, 14, 3.6, 17, 8] } });
+  map.addLayer({ id: 'lines-casing', type: 'line', source: 'lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 3, 14, 7, 17, 13, 21, 60] } });
+  map.addLayer({ id: 'lines', type: 'line', source: 'lines', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': ['get', 'c'], 'line-width': ['interpolate', ['linear'], ['zoom'], 10, 1.6, 14, 3.6, 17, 8, 21, 48] } });
 
-  map.addSource('stations', { type: 'geojson', data: { type: 'FeatureCollection', features: S.stations.map((s) => ({ type: 'Feature', properties: { id: s.id, name: s.name }, geometry: { type: 'Point', coordinates: [s.lon, s.lat] } })) } });
+  map.addSource('stations', { type: 'geojson', data: { type: 'FeatureCollection', features: S.stations.map((s) => ({ type: 'Feature', properties: { id: s.id, name: s.name, gs: ',' + [...new Set(s.routes.map(group))].join(',') + ',' }, geometry: { type: 'Point', coordinates: [s.lon, s.lat] } })) } });
   map.addLayer({ id: 'stations', type: 'circle', source: 'stations', minzoom: 11, paint: { 'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 1.6, 15, 5], 'circle-color': '#fff', 'circle-stroke-color': '#000', 'circle-stroke-width': 1.2 } });
   map.addLayer({ id: 'station-names', type: 'symbol', source: 'stations', minzoom: 13.5, layout: { 'text-field': ['get', 'name'], 'text-font': FONT, 'text-size': 11.5, 'text-offset': [0.9, 0], 'text-anchor': 'left', 'text-optional': true }, paint: { 'text-color': '#fff', 'text-halo-color': '#000', 'text-halo-width': 1.5 } });
   map.addLayer({ id: 'rail-names', type: 'symbol', source: 'rail-stations', minzoom: 12.5, layout: { 'text-field': ['get', 'name'], 'text-font': FONT, 'text-size': 11, 'text-offset': [0, 1], 'text-anchor': 'top', 'text-optional': true }, paint: { 'text-color': '#c9ccd2', 'text-halo-color': '#000', 'text-halo-width': 1.5 } });
@@ -318,25 +335,58 @@ function addLayers() {
   map.addSource('trains', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
   map.addSource('trains3d', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
   map.addLayer({ id: 'trains-3d', type: 'fill-extrusion', source: 'trains3d', layout: { visibility: 'none' }, paint: { 'fill-extrusion-color': ['get', 'c'], 'fill-extrusion-height': ['get', 'h'], 'fill-extrusion-base': ['get', 'b'], 'fill-extrusion-opacity': 0.95 } });
-  map.addLayer({ id: 'train-glow', type: 'circle', source: 'trains', filter: ['==', ['get', 'k'], 'm'], paint: { 'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 5, 14, 14, 17, 24], 'circle-color': ['get', 'c'], 'circle-opacity': 0.28, 'circle-blur': 0.8, 'circle-pitch-alignment': 'map' } });
-  map.addLayer({ id: 'trains', type: 'circle', source: 'trains', paint: {
-    'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, ['case', ['==', ['get', 'k'], 'r'], 3.2, 2.8], 13, ['case', ['==', ['get', 'k'], 'r'], 6, 6.5], 15, 9.5, 17, 13],
-    'circle-color': ['get', 'c'],
-    'circle-stroke-color': ['case', ['get', 'sel'], '#fff', ['==', ['get', 'k'], 'r'], '#fff', '#000'],
-    'circle-stroke-width': ['case', ['get', 'sel'], 3, ['==', ['get', 'k'], 'r'], 1.6, 1.3],
-    'circle-pitch-alignment': 'map',
+  makeTrainIcons();
+  map.addLayer({ id: 'train-sel', type: 'circle', source: 'trains', filter: ['==', ['get', 'sel'], true], paint: { 'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 9, 14, 20, 17, 40], 'circle-color': 'rgba(255,255,255,0.12)', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2, 'circle-pitch-alignment': 'map' } });
+  map.addLayer({ id: 'trains', type: 'symbol', source: 'trains', layout: {
+    'icon-image': ['get', 'i'], 'icon-rotate': ['-', ['get', 'b'], 90], 'icon-rotation-alignment': 'map', 'icon-pitch-alignment': 'map',
+    'icon-allow-overlap': true, 'icon-ignore-placement': true, 'symbol-sort-key': ['case', ['get', 'sel'], 2, ['==', ['get', 'k'], 'm'], 1, 0],
+    'icon-size': ['interpolate', ['exponential', 1.7], ['zoom'], 10, 0.42, 13, 0.8, 15, 1.7, 17, 3.6],
   } });
-  map.addLayer({ id: 'train-labels', type: 'symbol', source: 'trains', minzoom: 12.3, filter: ['==', ['get', 'k'], 'm'], layout: { 'text-field': ['get', 'l'], 'text-font': FONT, 'text-size': ['interpolate', ['linear'], ['zoom'], 12.3, 8, 15, 12, 17, 15], 'text-allow-overlap': true, 'text-ignore-placement': true, 'text-pitch-alignment': 'map', 'text-rotation-alignment': 'map' }, paint: { 'text-color': ['get', 't'] } });
+  map.addLayer({ id: 'train-labels', type: 'symbol', source: 'trains', minzoom: 13, filter: ['==', ['get', 'k'], 'm'], layout: { 'text-field': ['get', 'l'], 'text-font': FONT, 'text-size': ['interpolate', ['linear'], ['zoom'], 13, 9, 15, 12, 17, 16], 'text-allow-overlap': true, 'text-ignore-placement': true, 'text-rotation-alignment': 'viewport', 'text-pitch-alignment': 'viewport' }, paint: { 'text-color': ['get', 't'], 'text-halo-color': ['get', 'c'], 'text-halo-width': 1 } });
 
-  map.on('click', 'trains', (e) => { const p = e.features[0].properties; p.k === 'r' ? openRail(p.id) : openTrain(p.id); });
-  map.on('click', 'trains-3d', (e) => { const p = e.features[0].properties; p.k === 'r' ? openRail(p.id) : openTrain(p.id); });
-  map.on('click', 'stations', (e) => { if (!map.queryRenderedFeatures(e.point, { layers: ['trains'] }).length) openStation(e.features[0].properties.id); });
-  map.on('click', 'lines', (e) => { if (!map.queryRenderedFeatures(e.point, { layers: ['trains', 'stations'] }).length) selectLine(e.features[0].properties.g); });
+  map.on('click', (e) => handleClick(e.point));
   for (const l of ['trains', 'trains-3d', 'stations', 'lines']) {
     map.on('mouseenter', l, () => (map.getCanvas().style.cursor = 'pointer'));
     map.on('mouseleave', l, () => (map.getCanvas().style.cursor = ''));
   }
   map.on('dragstart', () => { if (mode === 'cab') setMode('3d'); });
+}
+
+function handleClick(pt) {
+  const box = [[pt.x - 6, pt.y - 6], [pt.x + 6, pt.y + 6]];
+  const hit = (layers) => map.queryRenderedFeatures(box, { layers: layers.filter((l) => map.getLayer(l)) });
+  let f = hit(['trains', 'trains-3d']);
+  if (f.length) { const p = f[0].properties; return p.k === 'r' ? openRail(p.id) : openTrain(p.id); }
+  f = hit(['stations']);
+  if (f.length) return openStation(f[0].properties.id);
+  f = hit(['lines']);
+  if (f.length && !selLine) return selectLine(f[0].properties.g);
+  hideCard();
+}
+
+// silhouettes de rames (vues de dessus, nez vers la droite), une par couleur
+function makeTrainIcons() {
+  const colors = new Set(Object.values(S.routes).map((r) => r.color));
+  for (const ag of Object.keys(R.routes)) for (const r of Object.values(R.routes[ag])) colors.add(r.color);
+  colors.add('#0039a6'); colors.add('#ee0034'); colors.add('#808183');
+  for (const c of colors) {
+    for (const rail of [false, true]) {
+      const id = (rail ? 'rail-' : 'sub-') + c;
+      if (map.hasImage(id)) continue;
+      const W = rail ? 96 : 76, H = rail ? 22 : 26, r = rail ? 5 : 12, cars = rail ? 6 : 5;
+      const cv = document.createElement('canvas'); cv.width = W + 6; cv.height = H + 6;
+      const g = cv.getContext('2d');
+      g.translate(3, 3);
+      g.beginPath(); g.roundRect(0, 0, W, H, [r * 0.5, r, r, r * 0.5]);
+      g.fillStyle = c; g.fill();
+      g.lineWidth = 3; g.strokeStyle = rail ? '#ffffff' : '#000000'; g.stroke();
+      g.strokeStyle = 'rgba(0,0,0,0.45)'; g.lineWidth = 1.5;
+      for (let i = 1; i < cars; i++) { const x = (W * i) / cars; g.beginPath(); g.moveTo(x, 3); g.lineTo(x, H - 3); g.stroke(); }
+      g.fillStyle = 'rgba(255,255,255,0.9)'; g.fillRect(W - 5, H * 0.25, 3, H * 0.5); // feux avant
+      const img = g.getImageData(0, 0, cv.width, cv.height);
+      map.addImage(id, { width: cv.width, height: cv.height, data: img.data }, { pixelRatio: 2 });
+    }
+  }
 }
 
 // ---------- modes de vue
@@ -361,22 +411,24 @@ function setMode(m) {
   mode = m;
   document.querySelectorAll('.modes button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
   document.body.classList.toggle('cab', m === 'cab');
-  document.getElementById('cab-hud').classList.toggle('hidden', m !== 'cab');
+  document.getElementById('cab-hud').classList.toggle('closed', m !== 'cab');
+  document.getElementById('hint').classList.toggle('closed', !(m === '3d' || m === 'under'));
   const three = m !== 'plan';
   if (map.getLayer('buildings-3d')) {
     map.setLayoutProperty('buildings-3d', 'visibility', three ? 'visible' : 'none');
     map.setPaintProperty('buildings-3d', 'fill-extrusion-opacity', m === 'under' ? 0.16 : 0.88);
   }
   map.setLayoutProperty('trains-3d', 'visibility', three ? 'visible' : 'none');
-  map.setLayoutProperty('lines-glow', 'visibility', m === 'under' ? 'visible' : 'none');
-  map.setPaintProperty('trains', 'circle-opacity', three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1);
-  map.setPaintProperty('trains', 'circle-stroke-opacity', three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1);
-  map.setPaintProperty('train-glow', 'circle-opacity', three ? 0 : 0.28);
-  map.setLayoutProperty('train-labels', 'visibility', three ? 'none' : 'visible');
+  map.setLayoutProperty('lines-glow', 'visibility', m === 'under' || selLine ? 'visible' : 'none');
+  const fade = three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1;
+  map.setPaintProperty('trains', 'icon-opacity', fade);
+  map.setPaintProperty('train-labels', 'text-opacity', fade);
+  map.setLayoutProperty('train-labels', 'visibility', m === 'cab' ? 'none' : 'visible');
+  map.setLayoutProperty('train-sel', 'visibility', m === 'cab' ? 'none' : 'visible');
   dimBase(m === 'under');
   if (m === 'plan') { cabTrain = null; map.easeTo({ pitch: 0, duration: 1000 }); }
   else if (m === '3d' || m === 'under') { cabTrain = null; map.easeTo({ pitch: m === 'under' ? 55 : 62, zoom: Math.max(map.getZoom(), 13.5), duration: 1200 }); }
-  else if (m === 'cab') { cabBearing = null; if (popup) popup.remove(); }
+  else if (m === 'cab') { cabBearing = null; hideCard(); }
 }
 
 function pickCabTrain() {
@@ -405,13 +457,23 @@ function trainHtml(tr) {
     <div class="actions"><button onclick="enterCab('${esc(tr.id)}')">Vue cabine</button><button onclick="selectLine('${group(tr.r)}')">Ligne ${label(tr.r)}</button></div></div>`;
 }
 
+function showCard(html, kind) {
+  const c = document.getElementById('card');
+  c.innerHTML = `<button class="close" onclick="hideCard()" aria-label="Fermer">×</button>${html}`;
+  c.classList.remove('closed');
+  cardKind = kind;
+}
+function hideCard() {
+  document.getElementById('card').classList.add('closed');
+  popupTrain = null; cardKind = null;
+}
+window.hideCard = hideCard;
+
 function openTrain(id) {
   const tr = trains.get(id);
   if (!tr || !tr.shown) return;
-  if (popup) popup.remove();
   popupTrain = id;
-  popup = new maplibregl.Popup({ offset: 14, closeOnClick: true }).setLngLat(tr.shown).setHTML(trainHtml(tr)).addTo(map);
-  popup.on('close', () => { if (popupTrain === id) popupTrain = null; });
+  showCard(trainHtml(tr), 'train');
 }
 
 function railRoute(t) { return ((R.routes[t.ag] || {})[t.routeId]) || { name: t.ag === 'LIRR' ? 'Long Island Rail Road' : 'Metro-North', color: t.ag === 'LIRR' ? '#0039a6' : '#ee0034' }; }
@@ -430,14 +492,11 @@ function railHtml(t) {
 function openRail(id) {
   const t = rail.get(id);
   if (!t) return;
-  if (popup) popup.remove();
   popupTrain = id;
-  popup = new maplibregl.Popup({ offset: 12 }).setLngLat(t.shownP).setHTML(railHtml(t)).addTo(map);
-  popup.on('close', () => { if (popupTrain === id) popupTrain = null; });
+  showCard(railHtml(t), 'rail');
 }
 
 function openStation(id) {
-  if (popup) popup.remove();
   popupTrain = null;
   const s = stationById[id];
   const now = nowS();
@@ -446,9 +505,7 @@ function openStation(id) {
   arrivals.sort((a, b) => a[0] - b[0]);
   const rows = arrivals.slice(0, 8).map(([t, tr]) => `<tr><td>${bulletHtml(tr.r, 'sm')} ${esc(destination(tr))}</td><td>${fmtMin(t, now)}</td></tr>`).join('');
   const al = alerts.filter((a) => a.stops.some((x) => x.replace(/[NS]$/, '') === id)).slice(0, 2).map((a) => `<div class="meta">⚠ ${esc(a.header)}</div>`).join('');
-  popup = new maplibregl.Popup({ offset: 8 }).setLngLat([s.lon, s.lat])
-    .setHTML(`<div class="pop"><h3>${esc(s.name)}</h3><div style="display:flex;gap:4px;margin-bottom:8px">${s.routes.map((r) => bulletHtml(r, 'sm')).join('')}</div>${al}<table>${rows || '<tr><td>Aucun passage annoncé</td><td></td></tr>'}</table></div>`)
-    .addTo(map);
+  showCard(`<div class="pop"><h3>${esc(s.name)}</h3><div style="display:flex;gap:4px;margin-bottom:8px">${s.routes.map((r) => bulletHtml(r, 'sm')).join('')}</div>${al}<table>${rows || '<tr><td>Aucun passage annoncé</td><td></td></tr>'}</table></div>`, 'station');
 }
 
 window.enterCab = (id) => { cabTrain = id; setMode('cab'); };
@@ -484,13 +541,18 @@ function selectLine(g) {
   selLine = selLine === g ? null : g;
   document.querySelectorAll('#legend .bullet').forEach((b) => { b.classList.toggle('sel', b.dataset.g === selLine); b.classList.toggle('dim', !!selLine && b.dataset.g !== selLine); });
   const op = (on, off) => (selLine ? ['case', ['==', ['get', 'g'], selLine], on, off] : on);
-  map.setPaintProperty('lines', 'line-opacity', op(1, 0.1));
-  map.setPaintProperty('lines-casing', 'line-opacity', op(1, 0.1));
-  map.setPaintProperty('lines-glow', 'line-opacity', op(0.4, 0));
-  map.setPaintProperty('rail-lines', 'line-opacity', selLine ? 0.12 : 0.55);
-  map.setPaintProperty('rail-lines-casing', 'line-opacity', selLine ? 0.2 : 0.7);
-  if (popup) popup.remove();
-  document.getElementById('line-panel').classList.toggle('hidden', !selLine);
+  map.setPaintProperty('lines', 'line-opacity', op(1, 0));
+  map.setPaintProperty('lines-casing', 'line-opacity', op(1, 0));
+  map.setPaintProperty('lines', 'line-width', selLine ? ['interpolate', ['linear'], ['zoom'], 10, 3.5, 14, 7, 17, 12, 21, 48] : ['interpolate', ['linear'], ['zoom'], 10, 1.6, 14, 3.6, 17, 8, 21, 48]);
+  map.setPaintProperty('lines-casing', 'line-width', selLine ? ['interpolate', ['linear'], ['zoom'], 10, 6, 14, 11, 17, 18, 21, 60] : ['interpolate', ['linear'], ['zoom'], 10, 3, 14, 7, 17, 13, 21, 60]);
+  map.setPaintProperty('lines-glow', 'line-opacity', op(0.5, 0));
+  map.setLayoutProperty('lines-glow', 'visibility', mode === 'under' || selLine ? 'visible' : 'none');
+  const stf = selLine ? ['in', ',' + selLine + ',', ['get', 'gs']] : null;
+  map.setFilter('stations', stf); map.setFilter('station-names', stf);
+  map.setLayerZoomRange('station-names', selLine ? 11.5 : 13.5, 24);
+  for (const l of ['rail-lines', 'rail-lines-casing', 'rail-stations', 'rail-names']) map.setLayoutProperty(l, 'visibility', selLine ? 'none' : 'visible');
+  hideCard();
+  document.getElementById('line-panel').classList.toggle('closed', !selLine);
   if (!selLine) return;
   const pat = linePattern(selLine);
   if (pat.length) {
@@ -579,6 +641,12 @@ function buildLegend() {
   }));
   document.querySelectorAll('.modes button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
   document.getElementById('lineClose').onclick = () => selectLine(selLine);
+  document.getElementById('collapse').onclick = () => document.getElementById('panel').classList.toggle('collapsed');
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (cardKind) hideCard(); else if (mode === 'cab') setMode('3d'); else if (selLine) selectLine(selLine);
+  });
+  setupOrbit();
   document.getElementById('cabExit').onclick = () => setMode('3d');
   document.getElementById('cabNext').onclick = () => {
     const ids = [...trains.values()].filter((t) => t.moving && t.id !== cabTrain && (!selLine || group(t.r) === selLine)).map((t) => t.id);
@@ -586,34 +654,56 @@ function buildLegend() {
   };
 }
 
+// En 3D : glisser = tourner autour du centre et incliner ; Maj + glisser = se déplacer
+function setupOrbit() {
+  const box = map.getContainer();
+  let o = null;
+  box.addEventListener('mousedown', (e) => {
+    if (!(mode === '3d' || mode === 'under') || e.button !== 0 || e.shiftKey || !map.getCanvasContainer().contains(e.target)) return;
+    o = { x: e.clientX, y: e.clientY, b: map.getBearing(), p: map.getPitch(), moved: false };
+    e.stopPropagation(); e.preventDefault();
+    map.getCanvas().style.cursor = 'grabbing';
+  }, true);
+  window.addEventListener('mousemove', (e) => {
+    if (!o) return;
+    const dx = e.clientX - o.x, dy = e.clientY - o.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) o.moved = true;
+    map.jumpTo({ bearing: o.b - dx * 0.35, pitch: Math.max(0, Math.min(85, o.p - dy * 0.3)) });
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (!o) return;
+    const moved = o.moved; o = null;
+    map.getCanvas().style.cursor = '';
+    if (!moved) { const r = map.getCanvas().getBoundingClientRect(); handleClick({ x: e.clientX - r.left, y: e.clientY - r.top }); }
+  });
+}
+
 // ---------- boucle d'animation
 let lastFrame = 0, lastHud = 0;
 function frame(ts) {
   requestAnimationFrame(frame);
-  if (!map.getSource('trains') || ts - lastFrame < 33) return;
+  if (!map.getSource('trains') || ts - lastFrame < 15) return;
   lastFrame = ts;
   const now = nowS();
   const feats = [], boxes = [];
   const perGroup = {};
   const three = mode !== 'plan';
+  // écart entre les deux sens : 30 m en vue d'ensemble, quelques mètres de près (rames sur la voie)
+  const sideM = Math.max(2.2, Math.min(30, 30 * Math.pow(2, 14 - map.getZoom())));
   for (const tr of trains.values()) {
     const g = group(tr.r);
-    const pos = position(tr, now);
+    const pos = position(tr, effTime(tr, now));
     tr.pos = pos;
     if (!pos) { tr.shown = null; continue; }
     if (pos.dir) tr.head = pos.dir;
     tr.moving = !!pos.dir;
-    let p = tr.head ? offsetRight(pos.p, tr.head) : pos.p;
-    if (tr.blendFrom) {
-      const u = Math.min(1, (now - tr.blendAt) / 1.5);
-      if (u >= 1) tr.blendFrom = null;
-      else p = [tr.blendFrom[0] + (p[0] - tr.blendFrom[0]) * u, tr.blendFrom[1] + (p[1] - tr.blendFrom[1]) * u];
-    }
+    const p = tr.head ? offsetRight(pos.p, tr.head, sideM) : pos.p;
     tr.shown = p;
     perGroup[g] = (perGroup[g] || 0) + 1;
     if (selLine && g !== selLine) continue;
     const c = routeColor(tr.r);
-    feats.push({ type: 'Feature', properties: { k: 'm', id: tr.id, c, t: routeText(tr.r), l: label(tr.r), g, sel: tr.id === popupTrain || tr.id === cabTrain }, geometry: { type: 'Point', coordinates: p } });
+    if (mode === 'cab' && tr.id === cabTrain) continue;
+    feats.push({ type: 'Feature', properties: { k: 'm', id: tr.id, c, t: routeText(tr.r), l: label(tr.r), g, i: 'sub-' + c, b: tr.head ? bearingOf(tr.head) : 0, sel: tr.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
     if (three && tr.head && !(mode === 'cab' && tr.id === cabTrain)) { const [n, len] = CARS[tr.r] || [10, 18.3]; pushCars(boxes, p, tr.head, n, len, c, tr.id, 'm'); }
   }
   let nRail = 0;
@@ -624,17 +714,12 @@ function frame(ts) {
     if (!railOn[t.ag] || selLine) continue;
     nRail++;
     const c = railRoute(t).color;
-    feats.push({ type: 'Feature', properties: { k: 'r', id: t.id, c, sel: t.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
     const dir = t.dir || (t.bearing != null ? [Math.sin(t.bearing * Math.PI / 180) / KX, Math.cos(t.bearing * Math.PI / 180)] : null);
+    feats.push({ type: 'Feature', properties: { k: 'r', id: t.id, c, i: 'rail-' + c, b: dir ? bearingOf(dir) : 0, sel: t.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
     if (three && dir) { const [n, len] = RAIL_CARS[t.ag]; pushCars(boxes, p, dir, n, len, c, t.id, 'r'); }
   }
   map.getSource('trains').setData({ type: 'FeatureCollection', features: feats });
   if (three) map.getSource('trains3d').setData({ type: 'FeatureCollection', features: boxes });
-  if (popupTrain && popup) {
-    const tr = trains.get(popupTrain) || rail.get(popupTrain);
-    const p = tr && (tr.shown || tr.shownP);
-    if (p) popup.setLngLat(p);
-  }
   if (mode === 'cab') cabCamera();
   if (ts - lastHud > 1000) { lastHud = ts; updateHud(now, perGroup, nRail); }
 }
@@ -645,13 +730,16 @@ function cabCamera() {
   if (!tr.head) return;
   const target = bearingOf(tr.head);
   if (cabBearing == null) cabBearing = target;
-  const d = ((target - cabBearing + 540) % 360) - 180;
-  cabBearing += d * 0.08;
-  const rad = cabBearing * Math.PI / 180;
-  // regard vers l'avant depuis la cabine : le centre de la vue est un peu devant la rame
-  const ahead = 60;
-  const c = [tr.shown[0] + Math.sin(rad) * ahead / M_LON, tr.shown[1] + Math.cos(rad) * ahead / M_LAT];
-  map.jumpTo({ center: c, bearing: cabBearing, pitch: 78, zoom: 18.2 });
+  cabBearing += (((target - cabBearing + 540) % 360) - 180) * 0.06;
+  const rad = cabBearing * Math.PI / 180, ux = Math.sin(rad), uy = Math.cos(rad);
+  const [n, len] = CARS[tr.r] || [10, 18.3];
+  const half = (n * len + (n - 1) * 1.2) / 2;
+  // œil du conducteur : à l'avant de la rame, à 3,5 m de haut ; regard vers la voie, 40 m devant
+  const base = tr.pos ? offsetRight(tr.pos.p, tr.head, 2.2) : tr.shown;
+  const eye = [base[0] + (ux * (half - 2)) / M_LON, base[1] + (uy * (half - 2)) / M_LAT];
+  const look = [eye[0] + (ux * 40) / M_LON, eye[1] + (uy * 40) / M_LAT];
+  const cam = map.calculateCameraOptionsFromTo(maplibregl.LngLat.convert(eye), 3.5, maplibregl.LngLat.convert(look), 0);
+  map.jumpTo({ ...cam, pitch: Math.min(85, cam.pitch) });
 }
 
 function updateHud(now, perGroup, nRail) {
@@ -664,9 +752,10 @@ function updateHud(now, perGroup, nRail) {
   const age = lastData ? Math.max(0, Math.round(now - lastData)) : null;
   st.className = statusErr ? 'err' : '';
   st.textContent = statusErr || (age == null ? 'Chargement…' : `Temps réel MTA · mis à jour il y a ${age} s · heure de New York`);
-  if (popupTrain && popup) {
+  if (popupTrain && cardKind) {
     const tr = trains.get(popupTrain);
-    if (tr) popup.setHTML(trainHtml(tr)); else { const t = rail.get(popupTrain); if (t) popup.setHTML(railHtml(t)); }
+    if (tr && cardKind === 'train') showCard(trainHtml(tr), 'train');
+    else { const t = rail.get(popupTrain); if (t && cardKind === 'rail') showCard(railHtml(t), 'rail'); }
   }
   updateStrip();
   if (mode === 'cab') {

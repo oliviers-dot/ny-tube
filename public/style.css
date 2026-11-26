@@ -12,9 +12,20 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .sign { position: absolute; background: var(--sign); color: var(--fg); border-radius: 4px; box-shadow: 0 12px 40px rgba(0,0,0,.55); padding: 18px 16px 14px; }
 .sign::before { content: ""; position: absolute; left: 0; right: 0; top: 7px; height: 2px; background: var(--rule); }
 .hidden { display: none !important; }
+/* entrées et sorties animées des panneaux */
+#line-panel, #card, #cab-hud, #hint, #panel { transition: transform .35s cubic-bezier(.2,.8,.2,1), opacity .25s ease; }
+#line-panel.closed { transform: translateX(calc(100% + 80px)); opacity: 0; pointer-events: none; }
+#card.closed { transform: translateY(calc(100% + 40px)); opacity: 0; pointer-events: none; }
+#cab-hud.closed { transform: translate(-50%, calc(100% + 40px)); opacity: 0; pointer-events: none; }
+#hint.closed { opacity: 0; transform: translate(-50%, 10px); pointer-events: none; }
 
 #panel { top: 16px; left: 16px; width: 300px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow: auto; }
-#panel header { display: flex; align-items: baseline; justify-content: space-between; margin-top: 4px; }
+#panel header { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
+#panel header h1 { flex: 1; }
+#collapse { background: none; border: 0; color: var(--muted); font-size: 18px; padding: 0 2px; transition: transform .25s; }
+#panel.collapsed #collapse { transform: rotate(-90deg); }
+#panel > *:not(header):not(#stats) { transition: opacity .2s; }
+#panel.collapsed > *:not(header):not(#stats) { display: none; }
 h1 { margin: 0; font-size: 30px; font-weight: 700; letter-spacing: -.01em; }
 #clock { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
 #stats { display: flex; gap: 14px; margin-top: 6px; color: var(--muted); font-size: 12px; }
@@ -100,3 +111,17 @@ body.cab #panel { display: none; }
   .bullet { width: 26px; height: 26px; font-size: 15px; }
   #line-panel { top: auto; bottom: 0; left: 0; right: 0; width: auto; max-height: 55vh; border-radius: 4px 4px 0 0; }
 }
+
+/* fiche d'info (rame, station) : glisse depuis le bas, se ferme d'un clic sur la carte ou Échap */
+#card { left: 332px; bottom: 16px; width: 320px; max-width: calc(100vw - 32px); max-height: 50vh; overflow: auto; }
+#card .close { position: absolute; top: 12px; right: 8px; background: none; border: 0; font-size: 22px; color: var(--muted); }
+#card .pop h3 { margin-right: 24px; }
+#hint { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); background: rgba(17,18,20,.85); color: #fff; font-size: 12px; font-weight: 700; padding: 7px 12px; border-radius: 3px; pointer-events: none; }
+body.cab #hint { display: none; }
+/* cabine : cadre de pare-brise */
+#cab-frame { position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity .6s; background:
+  linear-gradient(to bottom, #050506 0, #050506 6%, transparent 14%),
+  linear-gradient(to top, #050506 0, #0b0c0e 16%, transparent 30%),
+  linear-gradient(to right, #050506 0, transparent 7%), linear-gradient(to left, #050506 0, transparent 7%); }
+body.cab #cab-frame { opacity: 1; }
+@media (max-width: 700px) { #card { left: 0; right: 0; bottom: 0; width: auto; border-radius: 4px 4px 0 0; } }
