@@ -90,6 +90,27 @@ function box(p, dir, len, wid) {
   return [[pt(L, -W), pt(L, W), pt(-L, W), pt(-L, -W), pt(L, -W)]];
 }
 
+// ---------- composition des rames
+// Les flux MTA ne publient pas la composition réelle (champ GTFS-rt multi_carriage_details absent,
+// vérifié le 26/11/2026). On utilise la composition standard de chaque ligne : [nombre de voitures, longueur d'une voiture en m].
+const CARS = { '1': [10, 15.5], '2': [10, 15.5], '3': [10, 15.5], '4': [10, 15.5], '5': [10, 15.5], '6': [10, 15.5], '6X': [10, 15.5],
+  '7': [11, 15.5], '7X': [11, 15.5], B: [8, 22.9], D: [8, 22.9], N: [8, 22.9], Q: [8, 22.9], A: [8, 22.9],
+  C: [10, 18.3], E: [10, 18.3], F: [10, 18.3], FX: [10, 18.3], R: [10, 18.3], W: [10, 18.3],
+  M: [8, 18.3], J: [8, 18.3], Z: [8, 18.3], L: [8, 18.3], G: [5, 18.3], GS: [6, 15.5], FS: [2, 22.9], H: [4, 22.9], SI: [4, 22.9] };
+const RAIL_CARS = { LIRR: [10, 25.9], MNR: [8, 25.9] };
+
+// une boîte par voiture (caisse + toit plus clair), le long du sens de marche
+function pushCars(out, p, dir, n, len, color, id, k) {
+  const [ux, uy] = unit(dir);
+  const gap = 1.2, total = n * len + (n - 1) * gap;
+  for (let i = 0; i < n; i++) {
+    const off = -total / 2 + len / 2 + i * (len + gap);
+    const c = [p[0] + (ux * off) / M_LON, p[1] + (uy * off) / M_LAT];
+    out.push({ type: 'Feature', properties: { k, id, c: color, h: 5, b: 0.6 }, geometry: { type: 'Polygon', coordinates: box(c, dir, len, 4.2) } });
+    out.push({ type: 'Feature', properties: { k, id, c: '#b9bdc4', h: 5.6, b: 5 }, geometry: { type: 'Polygon', coordinates: box(c, dir, len * 0.55, 2.2) } });
+  }
+}
+
 // ---------- frises horaires du métro
 function patternKey(tripId) { return tripId.split('_').pop(); }
 function routeDirOf(key) { const m = /^([^.]+)\.+([NS])/.exec(key); return m ? m[1] + '|' + m[2] : null; }
@@ -348,8 +369,8 @@ function setMode(m) {
   }
   map.setLayoutProperty('trains-3d', 'visibility', three ? 'visible' : 'none');
   map.setLayoutProperty('lines-glow', 'visibility', m === 'under' ? 'visible' : 'none');
-  map.setPaintProperty('trains', 'circle-opacity', three ? ['interpolate', ['linear'], ['zoom'], 13, 1, 14.5, 0] : 1);
-  map.setPaintProperty('trains', 'circle-stroke-opacity', three ? ['interpolate', ['linear'], ['zoom'], 13, 1, 14.5, 0] : 1);
+  map.setPaintProperty('trains', 'circle-opacity', three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1);
+  map.setPaintProperty('trains', 'circle-stroke-opacity', three ? ['interpolate', ['linear'], ['zoom'], 15.3, 1, 16.3, 0] : 1);
   map.setPaintProperty('train-glow', 'circle-opacity', three ? 0 : 0.28);
   map.setLayoutProperty('train-labels', 'visibility', three ? 'none' : 'visible');
   dimBase(m === 'under');
@@ -593,7 +614,7 @@ function frame(ts) {
     if (selLine && g !== selLine) continue;
     const c = routeColor(tr.r);
     feats.push({ type: 'Feature', properties: { k: 'm', id: tr.id, c, t: routeText(tr.r), l: label(tr.r), g, sel: tr.id === popupTrain || tr.id === cabTrain }, geometry: { type: 'Point', coordinates: p } });
-    if (three && tr.head && !(mode === 'cab' && tr.id === cabTrain)) boxes.push({ type: 'Feature', properties: { k: 'm', id: tr.id, c, h: 11, b: 1 }, geometry: { type: 'Polygon', coordinates: box(p, tr.head, 140, 9) } });
+    if (three && tr.head && !(mode === 'cab' && tr.id === cabTrain)) { const [n, len] = CARS[tr.r] || [10, 18.3]; pushCars(boxes, p, tr.head, n, len, c, tr.id, 'm'); }
   }
   let nRail = 0;
   for (const t of rail.values()) {
@@ -605,7 +626,7 @@ function frame(ts) {
     const c = railRoute(t).color;
     feats.push({ type: 'Feature', properties: { k: 'r', id: t.id, c, sel: t.id === popupTrain }, geometry: { type: 'Point', coordinates: p } });
     const dir = t.dir || (t.bearing != null ? [Math.sin(t.bearing * Math.PI / 180) / KX, Math.cos(t.bearing * Math.PI / 180)] : null);
-    if (three && dir) boxes.push({ type: 'Feature', properties: { k: 'r', id: t.id, c, h: 14, b: 1 }, geometry: { type: 'Polygon', coordinates: box(p, dir, 220, 10) } });
+    if (three && dir) { const [n, len] = RAIL_CARS[t.ag]; pushCars(boxes, p, dir, n, len, c, t.id, 'r'); }
   }
   map.getSource('trains').setData({ type: 'FeatureCollection', features: feats });
   if (three) map.getSource('trains3d').setData({ type: 'FeatureCollection', features: boxes });
